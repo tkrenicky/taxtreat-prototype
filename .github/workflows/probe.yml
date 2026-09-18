@@ -14,8 +14,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: pip install remotezip
       - run: python scripts/probe_api.py
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ex10-probe
-          path: artifacts/probe.json
