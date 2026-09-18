@@ -10,7 +10,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import Counter
+from collections import Counter, defaultdict
+from remotezip import RemoteZip
 
 API = "https://sec.battleoftheforms.com/api/sec-contracts/search"
 OUT = pathlib.Path("artifacts")
@@ -242,30 +243,47 @@ def extract_record(meta, text, fmt, ocr_required, status_code, raw_bytes, error=
         "evidence": evidence,
     }
 
-def download_one(meta):
-    url = meta.get("source_document_url")
-    cid = meta.get("contract_id")
-    if not url:
-        return extract_record(meta, "", "missing-url", False, None, b"", "missing source URL")
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept-Encoding": "identity",
-        "Accept": "text/html,text/plain,application/pdf,*/*;q=0.5",
-    }
-    req = urllib.request.Request(url, headers=headers)
+def process_archive_group(item):
+    archive_url, metas = item
+    out = []
+    label = pathlib.Path(urllib.parse.urlparse(archive_url).path).name
     try:
-        with throttled_open(req, timeout=45) as r:
-            raw = r.read()
-            ctype = r.headers.get("Content-Type", "")
-            status = getattr(r, "status", 200)
-        suffix = pathlib.Path(urllib.parse.urlparse(url).path).suffix.lower()
-        if suffix not in {".txt", ".htm", ".html", ".pdf"}:
-            suffix = ".bin"
-        (RAW / f"{cid}{suffix}").write_bytes(raw)
-        text, fmt, ocr_required = normalize_text(raw, ctype, url)
-        return extract_record(meta, text, fmt, ocr_required, status, raw)
+        with RemoteZip(
+            archive_url,
+            headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},
+            timeout=90,
+        ) as z:
+            names = set(z.namelist())
+            print(f"ARCHIVE_OPEN {label}: entries={len(names)} requested={len(metas)}", flush=True)
+            for i, meta in enumerate(metas, 1):
+                dataset = meta.get("external_dataset") or {}
+                member = dataset.get("archive_member")
+                cid = meta.get("contract_id")
+                if not member or member not in names:
+                    out.append(extract_record(meta, "", "archive-missing", False, None, b"", f"archive member missing: {member}"))
+                    continue
+                try:
+                    raw = z.read(member)
+                    (RAW / f"{cid}.txt").write_bytes(raw)
+                    text, _, ocr_required = normalize_text(raw, "text/plain", member)
+                    rec = extract_record(meta, text, "text-converted", ocr_required, 206, raw)
+                    rec["archive_url"] = archive_url
+                    rec["archive_member"] = member
+                    rec["canonical_source_url"] = meta.get("source_document_url")
+                    rec["source_format"] = pathlib.Path(urllib.parse.urlparse(meta.get("source_document_url") or "").path).suffix.lower().lstrip(".") or "unknown"
+                    out.append(rec)
+                except Exception as exc:
+                    out.append(extract_record(meta, "", "archive-error", False, None, b"", f"{type(exc).__name__}: {exc}"))
+                if i % 50 == 0:
+                    ok = sum(1 for r in out if not r.get("download_error") and r.get("downloaded_bytes", 0) > 0)
+                    print(f"ARCHIVE_PROGRESS {label}: processed={i} successful={ok}", flush=True)
     except Exception as exc:
-        return extract_record(meta, "", "error", False, None, b"", f"{type(exc).__name__}: {exc}")
+        msg = f"{type(exc).__name__}: {exc}"
+        print(f"ARCHIVE_ERROR {label}: {msg}", flush=True)
+        for meta in metas:
+            out.append(extract_record(meta, "", "archive-error", False, None, b"", msg))
+    return out
+
 
 def safe_json(obj):
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).replace("</", "<\/")
@@ -365,24 +383,26 @@ def main():
     if len(candidates) < TARGET:
         raise SystemExit(f"Only {len(candidates)} unique candidates discovered; need {TARGET}")
 
-    selected = candidates[: min(len(candidates), 1350)]
-    records = []
-    # A small worker pool plus global throttler keeps source traffic conservative.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
-        futs = {ex.submit(download_one, m): m for m in selected}
-        for i, fut in enumerate(concurrent.futures.as_completed(futs), 1):
-            rec = fut.result()
-            if not rec.get("download_error") and rec.get("downloaded_bytes", 0) > 0:
-                records.append(rec)
-            if i % 50 == 0:
-                print(f"DOWNLOAD processed={i} successful={len(records)}", flush=True)
-            if len(records) >= TARGET:
-                # We cannot safely cancel running requests already started, but can stop collecting once target is met.
-                for f in futs:
-                    if not f.done():
-                        f.cancel()
-                break
+    selected = candidates[: min(len(candidates), 1150)]
+    groups = defaultdict(list)
+    for idx, meta in enumerate(selected):
+        meta["_selection_index"] = idx
+        dataset = meta.get("external_dataset") or {}
+        archive_url = dataset.get("archive_url")
+        if archive_url:
+            groups[archive_url].append(meta)
+    print(f"ARCHIVE_PLAN groups={len(groups)} selected={len(selected)}", flush=True)
 
+    records = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, max(1, len(groups)))) as ex:
+        futs = [ex.submit(process_archive_group, item) for item in groups.items()]
+        for fut in concurrent.futures.as_completed(futs):
+            batch = fut.result()
+            records.extend(r for r in batch if not r.get("download_error") and r.get("downloaded_bytes", 0) > 0)
+            print(f"DOWNLOAD successful_total={len(records)}", flush=True)
+
+    records.sort(key=lambda r: next((m.get("_selection_index", 10**9) for m in selected if m.get("contract_id")==r.get("contract_id")), 10**9))
+    records = records[:TARGET]
     # Stable presentation ordering.
     records = records[:TARGET]
     records.sort(key=lambda x: (x.get("filing_date") or "", x.get("contract_id") or ""), reverse=True)
