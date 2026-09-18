@@ -19,6 +19,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install ranged archive reader
+        run: pip install remotezip
       - name: Download 1000 real SEC licence candidates and build UI
         run: python scripts/build_licensebench.py
       - name: Upload raw first-1000 corpus and structured results
